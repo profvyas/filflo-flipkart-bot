@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+
+# Environment
+.env
+
+# Downloads
+downloads/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+
+# Error screenshots
+error-*.png

@@ -1,0 +1,26 @@
+{
+  "name": "filflo-flipkart-bot",
+  "version": "1.0.0",
+  "description": "Filflo automation bot for Flipkart Vendor Hub PO downloads",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "download-po": "node src/index.js download-po",
+    "download-po:headless": "node src/index.js download-po --headless"
+  },
+  "keywords": [
+    "automation",
+    "flipkart",
+    "filflo",
+    "purchase-orders"
+  ],
+  "author": "Filflo",
+  "license": "ISC",
+  "dependencies": {
+    "commander": "^11.1.0",
+    "dotenv": "^16.3.1",
+    "playwright": "^1.40.0",
+    "xlsx": "^0.18.5"
+  }
+}
