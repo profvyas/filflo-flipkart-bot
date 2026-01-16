@@ -189,96 +189,24 @@ export class FlipkartLoginTask extends BaseTask {
   }
 
   /**
-   * Select FKI and then company after login
+   * Select account/company after login
    */
   async selectFKI() {
     console.log('🏢 Waiting for account selection screen...');
     await this.page.waitForTimeout(3000);
 
-    // Step 1: Click FKI
-    console.log('🔍 Looking for FKI...');
-    let fkiClicked = false;
-
-    try {
-      // Try text locator first
-      const fkiElement = this.page.locator('text="FKI"').first();
-      const isVisible = await fkiElement.isVisible({ timeout: 5000 }).catch(() => false);
-
-      if (isVisible) {
-        await fkiElement.click();
-        console.log('✅ Clicked FKI');
-        fkiClicked = true;
-      }
-    } catch (err) {
-      // Try alternative approach
-    }
-
-    // Fallback: search all elements
-    if (!fkiClicked) {
-      try {
-        const elements = await this.page.$$('div, span, li, button, a, td');
-        for (const element of elements) {
-          const text = await element.textContent();
-          if (text && text.trim() === 'FKI') {
-            await element.click();
-            console.log('✅ Clicked FKI (via element search)');
-            fkiClicked = true;
-            break;
-          }
-        }
-      } catch (err) {
-        console.log('⚠️  Could not find FKI');
-      }
-    }
-
-    if (!fkiClicked) {
-      console.log('⚠️  FKI not found - continuing...');
-      return;
-    }
-
-    // Wait a moment after clicking FKI
-    await this.page.waitForTimeout(1000);
-
-    // Step 2: Click Next button
-    console.log('🔍 Looking for Next button...');
-    try {
-      const nextButton = this.page.locator('button:has-text("Next"), a:has-text("Next"), text="Next"').first();
-      const isVisible = await nextButton.isVisible({ timeout: 5000 }).catch(() => false);
-
-      if (isVisible) {
-        await nextButton.click();
-        console.log('✅ Clicked Next');
-      } else {
-        // Try fallback
-        const buttons = await this.page.$$('button, a');
-        for (const btn of buttons) {
-          const text = await btn.textContent();
-          if (text && text.trim().toLowerCase() === 'next') {
-            await btn.click();
-            console.log('✅ Clicked Next (via search)');
-            break;
-          }
-        }
-      }
-    } catch (err) {
-      console.log('⚠️  Next button not found');
-    }
-
-    // Wait for company list to appear
-    await this.page.waitForTimeout(2000);
-
-    // Step 3: Click company name
-    console.log('🏢 Looking for LIFELONG ONLINE RETAIL PRIVATE LIMITED...');
+    // Step 1: Try to select company directly (for accounts without FKI step)
+    console.log('🔍 Looking for GODESI MANDI PRIVATE LIMITED...');
     let companyClicked = false;
 
     try {
       // Try text locator with exact name
-      const companyElement = this.page.locator('text="LIFELONG ONLINE RETAIL PRIVATE LIMITED"').first();
+      const companyElement = this.page.locator('text="GODESI MANDI PRIVATE LIMITED"').first();
       const isVisible = await companyElement.isVisible({ timeout: 5000 }).catch(() => false);
 
       if (isVisible) {
         await companyElement.click();
-        console.log('✅ Selected: LIFELONG ONLINE RETAIL PRIVATE LIMITED');
+        console.log('✅ Selected: GODESI MANDI PRIVATE LIMITED');
         companyClicked = true;
       }
     } catch (err) {
@@ -291,7 +219,7 @@ export class FlipkartLoginTask extends BaseTask {
         const elements = await this.page.$$('div, span, li, button, a, td');
         for (const element of elements) {
           const text = await element.textContent();
-          if (text && text.toUpperCase().includes('LIFELONG')) {
+          if (text && text.toUpperCase().includes('GODESI MANDI')) {
             await element.click();
             console.log('✅ Selected company (via element search)');
             companyClicked = true;
@@ -304,17 +232,80 @@ export class FlipkartLoginTask extends BaseTask {
     }
 
     if (!companyClicked) {
-      console.log('⚠️  Company selection not found - continuing...');
+      // Try FKI flow as fallback
+      console.log('⚠️  Company not found directly, trying FKI flow...');
+      await this.tryFKIFlow();
+      return;
     }
 
     // Wait a moment after selecting company
     await this.page.waitForTimeout(1000);
 
-    // Step 4: Click Next button again
+    // Click Next/Continue button if present
+    await this.clickNextButton();
+
+    // Wait for dashboard to load
+    await this.page.waitForTimeout(3000);
+  }
+
+  /**
+   * Try FKI selection flow (for certain account types)
+   */
+  async tryFKIFlow() {
+    console.log('🔍 Looking for FKI...');
+    let fkiClicked = false;
+
+    try {
+      const fkiElement = this.page.locator('text="FKI"').first();
+      const isVisible = await fkiElement.isVisible({ timeout: 3000 }).catch(() => false);
+
+      if (isVisible) {
+        await fkiElement.click();
+        console.log('✅ Clicked FKI');
+        fkiClicked = true;
+      }
+    } catch (err) {
+      // Continue
+    }
+
+    if (!fkiClicked) {
+      console.log('⚠️  FKI not found - continuing...');
+      return;
+    }
+
+    await this.page.waitForTimeout(1000);
+    await this.clickNextButton();
+    await this.page.waitForTimeout(2000);
+
+    // Select company after FKI
+    console.log('🏢 Looking for company after FKI...');
+    try {
+      const elements = await this.page.$$('div, span, li, button, a, td');
+      for (const element of elements) {
+        const text = await element.textContent();
+        if (text && text.toUpperCase().includes('GODESI MANDI')) {
+          await element.click();
+          console.log('✅ Selected company');
+          break;
+        }
+      }
+    } catch (err) {
+      console.log('⚠️  Could not find company');
+    }
+
+    await this.page.waitForTimeout(1000);
+    await this.clickNextButton();
+    await this.page.waitForTimeout(3000);
+  }
+
+  /**
+   * Click Next/Continue button if present
+   */
+  async clickNextButton() {
     console.log('🔍 Looking for Next button...');
     try {
-      const nextButton = this.page.locator('button:has-text("Next"), a:has-text("Next"), text="Next"').first();
-      const isVisible = await nextButton.isVisible({ timeout: 5000 }).catch(() => false);
+      const nextButton = this.page.locator('button:has-text("Next"), a:has-text("Next"), button:has-text("Continue"), text="Next"').first();
+      const isVisible = await nextButton.isVisible({ timeout: 3000 }).catch(() => false);
 
       if (isVisible) {
         await nextButton.click();
@@ -324,7 +315,7 @@ export class FlipkartLoginTask extends BaseTask {
         const buttons = await this.page.$$('button, a');
         for (const btn of buttons) {
           const text = await btn.textContent();
-          if (text && text.trim().toLowerCase() === 'next') {
+          if (text && (text.trim().toLowerCase() === 'next' || text.trim().toLowerCase() === 'continue')) {
             await btn.click();
             console.log('✅ Clicked Next (via search)');
             break;
@@ -334,8 +325,5 @@ export class FlipkartLoginTask extends BaseTask {
     } catch (err) {
       console.log('⚠️  Next button not found');
     }
-
-    // Wait for dashboard to load
-    await this.page.waitForTimeout(3000);
   }
 }
