@@ -63,6 +63,7 @@ Create a `.env` file:
 ```env
 FLIPKART_EMAIL=your-email@example.com
 FLIPKART_PASSWORD=your-password
+COMPANY_NAME=YOUR COMPANY NAME HERE
 
 DOWNLOAD_PATH=./downloads/flipkart
 MAX_ORDERS=0  # 0 = download all

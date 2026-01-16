@@ -12,6 +12,7 @@ export class FlipkartLoginTask extends BaseTask {
     super(taskConfig);
     this.flipkartEmail = taskConfig.flipkartEmail;
     this.flipkartPassword = taskConfig.flipkartPassword;
+    this.companyName = taskConfig.companyName || '';
   }
 
   /**
@@ -195,31 +196,37 @@ export class FlipkartLoginTask extends BaseTask {
     console.log('🏢 Waiting for account selection screen...');
     await this.page.waitForTimeout(3000);
 
+    if (!this.companyName) {
+      console.log('⚠️  No company name configured, skipping company selection...');
+      return;
+    }
+
     // Step 1: Try to select company directly (for accounts without FKI step)
-    console.log('🔍 Looking for GODESI MANDI PRIVATE LIMITED...');
+    console.log(`🔍 Looking for ${this.companyName}...`);
     let companyClicked = false;
 
     try {
       // Try text locator with exact name
-      const companyElement = this.page.locator('text="GODESI MANDI PRIVATE LIMITED"').first();
+      const companyElement = this.page.locator(`text="${this.companyName}"`).first();
       const isVisible = await companyElement.isVisible({ timeout: 5000 }).catch(() => false);
 
       if (isVisible) {
         await companyElement.click();
-        console.log('✅ Selected: GODESI MANDI PRIVATE LIMITED');
+        console.log(`✅ Selected: ${this.companyName}`);
         companyClicked = true;
       }
     } catch (err) {
       // Try alternative
     }
 
-    // Fallback: search with partial match
+    // Fallback: search with partial match (first two words of company name)
     if (!companyClicked) {
+      const searchTerm = this.companyName.split(' ').slice(0, 2).join(' ').toUpperCase();
       try {
         const elements = await this.page.$$('div, span, li, button, a, td');
         for (const element of elements) {
           const text = await element.textContent();
-          if (text && text.toUpperCase().includes('GODESI MANDI')) {
+          if (text && text.toUpperCase().includes(searchTerm)) {
             await element.click();
             console.log('✅ Selected company (via element search)');
             companyClicked = true;
@@ -279,11 +286,12 @@ export class FlipkartLoginTask extends BaseTask {
 
     // Select company after FKI
     console.log('🏢 Looking for company after FKI...');
+    const searchTerm = this.companyName.split(' ').slice(0, 2).join(' ').toUpperCase();
     try {
       const elements = await this.page.$$('div, span, li, button, a, td');
       for (const element of elements) {
         const text = await element.textContent();
-        if (text && text.toUpperCase().includes('GODESI MANDI')) {
+        if (text && text.toUpperCase().includes(searchTerm)) {
           await element.click();
           console.log('✅ Selected company');
           break;

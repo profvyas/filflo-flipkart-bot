@@ -12,6 +12,7 @@ export class FlipkartLoginAndDownloadPOTask extends BaseTask {
     super(taskConfig);
     this.flipkartEmail = taskConfig.flipkartEmail;
     this.flipkartPassword = taskConfig.flipkartPassword;
+    this.companyName = taskConfig.companyName || '';
     this.downloadPath = taskConfig.downloadPath || './downloads/flipkart';
     this.maxOrders = taskConfig.maxOrders || 0; // 0 = all orders
   }
@@ -32,7 +33,8 @@ export class FlipkartLoginAndDownloadPOTask extends BaseTask {
 
     this.loginTask = new FlipkartLoginTask({
       flipkartEmail: this.flipkartEmail,
-      flipkartPassword: this.flipkartPassword
+      flipkartPassword: this.flipkartPassword,
+      companyName: this.companyName
     });
 
     // Share browser context with login task

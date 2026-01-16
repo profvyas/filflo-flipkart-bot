@@ -39,6 +39,7 @@ program
       headless,
       flipkartEmail: config.flipkart.email,
       flipkartPassword: config.flipkart.password,
+      companyName: config.flipkart.companyName,
       downloadPath: config.flipkart.downloadPath,
       maxOrders: maxOrders
     });
