@@ -149,6 +149,4 @@ This tool is for personal use to automate your own Flipkart Vendor Hub account. 
 
 ---
 
-**Built with mass amounts of mass chai and mass frustration with manual processes.**
-
-If this saved you time, mass mass star karo!
+**Built to save time for Flipkart sellers.**
