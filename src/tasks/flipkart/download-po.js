@@ -18,6 +18,23 @@ export class FlipkartDownloadPOTask extends BaseTask {
   }
 
   /**
+   * Get the PO number from the first data row of the table
+   * Used to verify page content actually changed after pagination
+   * @returns {string|null} PO number or null if not found
+   */
+  async getFirstRowPONumber() {
+    try {
+      const firstDataRow = this.page.locator('div[role="row"]').nth(1); // Skip header
+      const rowText = await firstDataRow.textContent();
+      // Extract PO number pattern like "FLGWN07529757"
+      const poMatch = rowText.match(/[A-Z]{2,5}\d{8,}/);
+      return poMatch ? poMatch[0] : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /**
    * Main download flow
    */
   async run() {
@@ -311,81 +328,95 @@ export class FlipkartDownloadPOTask extends BaseTask {
   }
 
   /**
-   * Click "Next" button and wait for table to reload
-   * @returns {boolean} True if navigation succeeded
+   * Click "Next" button and wait for table content to actually change
+   * @returns {boolean} True if navigation succeeded and content changed
    */
   async goToNextPage() {
     console.log('\n📄 Navigating to next page...');
 
-    // Approach 1: Find buttons near "of X pages" text that look like navigation
+    // Capture first row PO number before clicking
+    const poBefore = await this.getFirstRowPONumber();
+    console.log(`   Current first PO: ${poBefore || 'unknown'}`);
+
+    // Helper to verify content actually changed after clicking
+    const verifyContentChanged = async () => {
+      for (let i = 0; i < 10; i++) {
+        await this.page.waitForTimeout(1000);
+        const poAfter = await this.getFirstRowPONumber();
+        if (poAfter && poAfter !== poBefore) {
+          console.log(`   ✅ Page content changed: ${poBefore} → ${poAfter}`);
+          return true;
+        }
+      }
+      console.log('   ⚠️ Page content did not change after 10 seconds');
+      return false;
+    };
+
+    // Approach 1: Use Playwright's text locator for ">" button
     try {
-      // Get all buttons and check their position/content
-      const allButtons = await this.page.$$('button');
-      console.log(`   Found ${allButtons.length} buttons on page`);
+      // Try multiple selectors for the next button
+      const nextSelectors = [
+        'button:has-text(">")',           // Button containing >
+        'span:text-is(">")',              // Span with exact >
+        'div:text-is(">")',               // Div with exact >
+        '[role="button"]:has-text(">")',  // Role button containing >
+      ];
 
-      for (const btn of allButtons) {
-        const text = await btn.textContent().catch(() => '');
-        const trimmed = text.trim();
-        const innerHTML = await btn.evaluate(el => el.innerHTML).catch(() => '');
+      for (const selector of nextSelectors) {
+        const btn = this.page.locator(selector).first();
+        const isVisible = await btn.isVisible({ timeout: 1000 }).catch(() => false);
 
-        // Match ">" or "›" or contains chevron/arrow SVG
-        const isNextButton =
-          trimmed === '>' ||
-          trimmed === '›' ||
-          trimmed === '»' ||
-          trimmed === '→' ||
-          innerHTML.includes('chevron') ||
-          innerHTML.includes('arrow') ||
-          innerHTML.includes('right') ||
-          innerHTML.includes('next');
-
-        if (isNextButton) {
-          const isDisabled = await btn.evaluate(el => {
-            return el.disabled ||
-                   el.classList.contains('disabled') ||
-                   el.getAttribute('aria-disabled') === 'true';
+        if (isVisible) {
+          const isDisabled = await btn.evaluate(node => {
+            return node.disabled ||
+                   node.classList.contains('disabled') ||
+                   node.getAttribute('aria-disabled') === 'true' ||
+                   node.style.opacity === '0.5';
           }).catch(() => false);
 
           if (!isDisabled) {
-            console.log(`   Found next button (text: "${trimmed}"), clicking...`);
+            console.log(`   Found ">" via "${selector}", clicking...`);
             await btn.click();
-            console.log('   ⏳ Waiting for next page to load...');
-            await this.page.waitForTimeout(5000);
-            console.log('   ✅ Navigated to next page');
-            return true;
+            console.log('   ⏳ Waiting for page content to change...');
+            return await verifyContentChanged();
+          } else {
+            console.log(`   Found ">" via "${selector}" but it's disabled`);
           }
         }
       }
+      console.log('   No ">" button found via text selectors');
     } catch (e) {
-      console.log(`   Button search error: ${e.message}`);
+      console.log(`   ">" button search error: ${e.message}`);
     }
 
-    // Approach 2: Find by position - button after the page number display
+    // Approach 2: Find pagination controls by inspecting DOM near "X of Y pages"
     try {
-      // Look for the pagination container and find the last button (usually "next")
-      const paginationArea = this.page.locator('text=/of \\d+ pages/i').first();
-      const isVisible = await paginationArea.isVisible({ timeout: 2000 }).catch(() => false);
+      // Look for the pagination text "X of Y pages"
+      const paginationText = this.page.locator('text=/\\d+ of \\d+ pages/i').first();
+      const isVisible = await paginationText.isVisible({ timeout: 2000 }).catch(() => false);
 
       if (isVisible) {
-        // Get parent container and find buttons within it
-        const parent = paginationArea.locator('xpath=ancestor::div[contains(@class, "pagination") or contains(@class, "pager") or .//button]').first();
-        const buttons = parent.locator('button');
-        const count = await buttons.count();
-        console.log(`   Found ${count} buttons in pagination area`);
+        // Go up to a reasonable parent container and log its structure
+        const grandParent = paginationText.locator('xpath=ancestor::div[3]').first();
+        const html = await grandParent.evaluate(el => el.outerHTML).catch(() => '');
+        console.log(`   Pagination area HTML (truncated):\n${html.substring(0, 1000)}`);
 
-        if (count >= 2) {
-          // Usually the last button is "next"
-          const nextBtn = buttons.last();
-          const isDisabled = await nextBtn.evaluate(el => el.disabled).catch(() => false);
+        // Try to find SVG elements (likely the arrow icons)
+        const svgs = grandParent.locator('svg');
+        const svgCount = await svgs.count();
+        console.log(`   Found ${svgCount} SVG elements`);
 
-          if (!isDisabled) {
-            console.log('   Clicking last pagination button (next)...');
-            await nextBtn.click();
-            console.log('   ⏳ Waiting for next page to load...');
-            await this.page.waitForTimeout(5000);
-            console.log('   ✅ Navigated to next page');
-            return true;
-          }
+        // The last SVG is likely the ">" next button
+        if (svgCount >= 2) {
+          // Assume layout is [<] [current] [>], so last SVG is next
+          const nextSvg = svgs.last();
+          const parent = nextSvg.locator('xpath=ancestor::*[self::button or self::div or self::span][1]').first();
+
+          console.log('   Clicking on next button (last SVG parent)...');
+          await parent.scrollIntoViewIfNeeded();
+          await parent.click({ force: true });
+          console.log('   ⏳ Waiting for page content to change...');
+          return await verifyContentChanged();
         }
       }
     } catch (e) {
@@ -399,10 +430,8 @@ export class FlipkartDownloadPOTask extends BaseTask {
       if (isVisible) {
         console.log('   Found ">" via text locator, clicking...');
         await nextArrow.click();
-        console.log('   ⏳ Waiting for next page to load...');
-        await this.page.waitForTimeout(5000);
-        console.log('   ✅ Navigated to next page');
-        return true;
+        console.log('   ⏳ Waiting for page content to change...');
+        return await verifyContentChanged();
       }
     } catch (e) {
       // Continue
@@ -429,10 +458,8 @@ export class FlipkartDownloadPOTask extends BaseTask {
           if (!isDisabled) {
             console.log(`   Clicking: ${selector}`);
             await button.click();
-            console.log('   ⏳ Waiting for next page to load...');
-            await this.page.waitForTimeout(5000);
-            console.log('   ✅ Navigated to next page');
-            return true;
+            console.log('   ⏳ Waiting for page content to change...');
+            return await verifyContentChanged();
           }
         }
       } catch (e) {
@@ -499,10 +526,10 @@ export class FlipkartDownloadPOTask extends BaseTask {
         break;
       }
 
-      // Navigate to next page
+      // Navigate to next page (verifies content actually changed)
       const navigated = await this.goToNextPage();
       if (!navigated) {
-        console.log('⚠️  Could not navigate to next page, stopping pagination');
+        console.log('⚠️  Page navigation failed or content unchanged, stopping pagination');
         break;
       }
 
