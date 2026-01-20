@@ -190,7 +190,8 @@ export class FlipkartLoginTask extends BaseTask {
   }
 
   /**
-   * Select account/company after login
+   * Select FKI first, then company after login
+   * Flow: Click FKI -> Click Next -> Select Company -> Click Next
    */
   async selectFKI() {
     console.log('🏢 Waiting for account selection screen...');
@@ -201,12 +202,40 @@ export class FlipkartLoginTask extends BaseTask {
       return;
     }
 
-    // Step 1: Try to select company directly (for accounts without FKI step)
+    // Step 1: Click FKI first (required step)
+    console.log('🔍 Looking for FKI...');
+    let fkiClicked = false;
+
+    try {
+      const fkiElement = this.page.locator('text="FKI"').first();
+      const isVisible = await fkiElement.isVisible({ timeout: 5000 }).catch(() => false);
+
+      if (isVisible) {
+        await fkiElement.click();
+        console.log('✅ Clicked FKI');
+        fkiClicked = true;
+      }
+    } catch (err) {
+      // Continue
+    }
+
+    if (!fkiClicked) {
+      console.log('⚠️  FKI not found - continuing without FKI step...');
+    }
+
+    // Step 2: Click Next button after FKI selection
+    if (fkiClicked) {
+      await this.page.waitForTimeout(1000);
+      await this.clickNextButton();
+      await this.page.waitForTimeout(2000);
+    }
+
+    // Step 3: Select the company
     console.log(`🔍 Looking for ${this.companyName}...`);
     let companyClicked = false;
 
+    // Try exact match first
     try {
-      // Try text locator with exact name
       const companyElement = this.page.locator(`text="${this.companyName}"`).first();
       const isVisible = await companyElement.isVisible({ timeout: 5000 }).catch(() => false);
 
@@ -239,70 +268,14 @@ export class FlipkartLoginTask extends BaseTask {
     }
 
     if (!companyClicked) {
-      // Try FKI flow as fallback
-      console.log('⚠️  Company not found directly, trying FKI flow...');
-      await this.tryFKIFlow();
-      return;
+      console.log('⚠️  Company not found - manual selection may be required');
     }
 
-    // Wait a moment after selecting company
+    // Step 4: Click Next button after company selection
     await this.page.waitForTimeout(1000);
-
-    // Click Next/Continue button if present
     await this.clickNextButton();
 
     // Wait for dashboard to load
-    await this.page.waitForTimeout(3000);
-  }
-
-  /**
-   * Try FKI selection flow (for certain account types)
-   */
-  async tryFKIFlow() {
-    console.log('🔍 Looking for FKI...');
-    let fkiClicked = false;
-
-    try {
-      const fkiElement = this.page.locator('text="FKI"').first();
-      const isVisible = await fkiElement.isVisible({ timeout: 3000 }).catch(() => false);
-
-      if (isVisible) {
-        await fkiElement.click();
-        console.log('✅ Clicked FKI');
-        fkiClicked = true;
-      }
-    } catch (err) {
-      // Continue
-    }
-
-    if (!fkiClicked) {
-      console.log('⚠️  FKI not found - continuing...');
-      return;
-    }
-
-    await this.page.waitForTimeout(1000);
-    await this.clickNextButton();
-    await this.page.waitForTimeout(2000);
-
-    // Select company after FKI
-    console.log('🏢 Looking for company after FKI...');
-    const searchTerm = this.companyName.split(' ').slice(0, 2).join(' ').toUpperCase();
-    try {
-      const elements = await this.page.$$('div, span, li, button, a, td');
-      for (const element of elements) {
-        const text = await element.textContent();
-        if (text && text.toUpperCase().includes(searchTerm)) {
-          await element.click();
-          console.log('✅ Selected company');
-          break;
-        }
-      }
-    } catch (err) {
-      console.log('⚠️  Could not find company');
-    }
-
-    await this.page.waitForTimeout(1000);
-    await this.clickNextButton();
     await this.page.waitForTimeout(3000);
   }
 

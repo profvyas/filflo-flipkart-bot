@@ -97,7 +97,11 @@ export function generateMergedFilename(prefix = 'combined_po', extension = '.xls
  * - Header rows with PO info (PO ID, date, warehouse, etc.)
  * - Line item rows (SKU, product name, qty, price)
  *
- * This extracts PO header info and prepends it to each line item row
+ * This extracts PO header info and prepends it to each line item row.
+ * Uses a two-pass approach to handle files with different column structures:
+ * 1. First pass: Collect all unique line item headers from all files
+ * 2. Second pass: Map each file's data to the canonical header positions
+ *
  * @param {string[]} filePaths - Array of file paths to merge
  * @param {string} outputPath - Path for the merged output file
  * @returns {string} Path to the merged file
@@ -109,45 +113,117 @@ export function flattenAndMergePoFiles(filePaths, outputPath) {
 
   console.log(`\n📊 Flattening and merging ${filePaths.length} PO file(s)...`);
 
-  const allRows = [];
-  let outputHeaders = null;
-  let totalRows = 0;
+  // Fixed metadata headers (always in this order)
+  const metadataHeaders = ['PO_Number', 'Category', 'Order_Date', 'PO_Expiry', 'Supplier_Name', 'Payment_Term'];
+
+  // PASS 1: Collect all unique line item headers from all files
+  console.log(`   🔍 Pass 1: Scanning files for column headers...`);
+  const allLineItemHeadersSet = new Set();
+  const fileDataCache = []; // Cache parsed data to avoid re-reading
 
   for (const filePath of filePaths) {
     try {
-      console.log(`   📄 Processing: ${path.basename(filePath)}`);
-
       const workbook = XLSX.readFile(filePath);
       const sheetName = workbook.SheetNames[0];
       const sheet = workbook.Sheets[sheetName];
       const data = XLSX.utils.sheet_to_json(sheet, { header: 1 });
 
       if (data.length === 0) {
-        console.log(`   ⚠️  Empty file: ${path.basename(filePath)}`);
+        fileDataCache.push({ filePath, data: null });
         continue;
       }
 
-      // Flatten this PO's data
-      const { headers, rows } = flattenPoData(data);
+      // Get line item headers from this file
+      const lineItemHeaders = getLineItemHeaders(data);
+      lineItemHeaders.forEach(h => {
+        if (h !== undefined && h !== null && h !== '') {
+          allLineItemHeadersSet.add(h);
+        }
+      });
 
-      // First file with data - capture headers
-      if (!outputHeaders && headers && headers.length > 0) {
-        outputHeaders = headers;
-        allRows.push(outputHeaders);
-      }
-
-      // Add flattened data rows
-      if (rows && rows.length > 0) {
-        allRows.push(...rows);
-        totalRows += rows.length;
-        console.log(`   ✅ Added ${rows.length} rows from ${path.basename(filePath)}`);
-      }
+      fileDataCache.push({ filePath, data, lineItemHeaders });
     } catch (error) {
-      console.error(`   ❌ Error processing ${path.basename(filePath)}: ${error.message}`);
+      console.error(`   ❌ Error reading ${path.basename(filePath)}: ${error.message}`);
+      fileDataCache.push({ filePath, data: null, error: error.message });
     }
   }
 
-  if (allRows.length === 0) {
+  // Build canonical header order: metadata + all unique line item headers
+  // Preserve order by using the first file's headers as base, then append any extras
+  const canonicalLineItemHeaders = [];
+  for (const { lineItemHeaders } of fileDataCache) {
+    if (lineItemHeaders) {
+      for (const h of lineItemHeaders) {
+        if (h !== undefined && h !== null && h !== '' && !canonicalLineItemHeaders.includes(h)) {
+          canonicalLineItemHeaders.push(h);
+        }
+      }
+    }
+  }
+
+  const canonicalHeaders = [...metadataHeaders, ...canonicalLineItemHeaders];
+  console.log(`   📋 Canonical columns: ${canonicalHeaders.length} (${metadataHeaders.length} metadata + ${canonicalLineItemHeaders.length} line item)`);
+
+  // PASS 2: Process data with column mapping
+  console.log(`   🔄 Pass 2: Processing files with column alignment...`);
+  const allRows = [canonicalHeaders]; // Start with header row
+  let totalRows = 0;
+
+  for (const { filePath, data, lineItemHeaders, error } of fileDataCache) {
+    if (error || !data) {
+      if (!error) console.log(`   ⚠️  Empty file: ${path.basename(filePath)}`);
+      continue;
+    }
+
+    console.log(`   📄 Processing: ${path.basename(filePath)}`);
+
+    // Build column mapping: source index -> canonical index
+    const columnMapping = new Map();
+    if (lineItemHeaders) {
+      for (let srcIdx = 0; srcIdx < lineItemHeaders.length; srcIdx++) {
+        const header = lineItemHeaders[srcIdx];
+        if (header !== undefined && header !== null && header !== '') {
+          const canonicalIdx = canonicalLineItemHeaders.indexOf(header);
+          if (canonicalIdx !== -1) {
+            // Add metadataHeaders.length offset since line items come after metadata
+            columnMapping.set(srcIdx, metadataHeaders.length + canonicalIdx);
+          }
+        }
+      }
+    }
+
+    // Flatten this PO's data using the column mapping
+    const { metadata, lineItems } = extractPoDataWithMapping(data);
+
+    // Map each line item row to canonical positions
+    for (const row of lineItems) {
+      // Create output row with all positions initialized to empty
+      const outputRow = new Array(canonicalHeaders.length).fill('');
+
+      // Fill metadata positions (0-5)
+      outputRow[0] = metadata.poNumber || '';
+      outputRow[1] = metadata.category || '';
+      outputRow[2] = metadata.orderDate || '';
+      outputRow[3] = metadata.poExpiry || '';
+      outputRow[4] = metadata.supplierName || '';
+      outputRow[5] = metadata.paymentTerm || '';
+
+      // Fill line item positions using column mapping
+      for (let srcIdx = 0; srcIdx < row.length; srcIdx++) {
+        const targetIdx = columnMapping.get(srcIdx);
+        if (targetIdx !== undefined) {
+          outputRow[targetIdx] = row[srcIdx] !== undefined ? row[srcIdx] : '';
+        }
+      }
+
+      allRows.push(outputRow);
+    }
+
+    totalRows += lineItems.length;
+    console.log(`   ✅ Added ${lineItems.length} rows from ${path.basename(filePath)}`);
+  }
+
+  if (allRows.length <= 1) {
     throw new Error('No data found in any of the files');
   }
 
@@ -172,37 +248,35 @@ export function flattenAndMergePoFiles(filePaths, outputPath) {
 }
 
 /**
- * Flatten a single PO's data
- *
- * Flipkart PO structure:
- * - Row 0: Flipkart header
- * - Row 1: PO# and metadata (PO#, Nature of Supply, Category, Order Date, etc.)
- * - Row 2: Supplier name and address
- * - Row 3-4: Billing info
- * - Row 5-6: Payment details
- * - Row 7-8: Approval details
- * - Row 9: "ORDER DETAILS" label
- * - Row 10: Column headers for line items
- * - Row 11+: Actual line items (until summary row)
- *
- * This extracts PO metadata and prepends it to each line item row.
- *
+ * Get line item headers from a PO file's data
  * @param {Array[]} data - Raw sheet data as array of arrays
- * @returns {Object} { headers: Array, rows: Array[] }
+ * @returns {Array} Line item headers array
  */
-function flattenPoData(data) {
-  if (!data || data.length === 0) {
-    return { headers: [], rows: [] };
+function getLineItemHeaders(data) {
+  if (!data || data.length === 0) return [];
+
+  for (let i = 0; i < data.length; i++) {
+    const row = data[i];
+    if (row && row[0] && (row[0] === 'S. no.' || row[0] === 'S.no.' || row[0] === 'Sno' || row[0] === 'S No')) {
+      return row;
+    }
   }
+  return [];
+}
 
-  // Extract PO metadata from header rows
+/**
+ * Extract PO data with raw line items (no header combining)
+ * @param {Array[]} data - Raw sheet data as array of arrays
+ * @returns {Object} { metadata, lineItems }
+ */
+function extractPoDataWithMapping(data) {
   const metadata = extractPoMetadata(data);
+  const lineItems = [];
 
-  // Find the ORDER DETAILS section and line items
+  // Find line items header row
   let lineItemsHeaderIndex = -1;
   for (let i = 0; i < data.length; i++) {
     const row = data[i];
-    // Line items header row typically starts with "S. no." or similar
     if (row && row[0] && (row[0] === 'S. no.' || row[0] === 'S.no.' || row[0] === 'Sno' || row[0] === 'S No')) {
       lineItemsHeaderIndex = i;
       break;
@@ -210,44 +284,25 @@ function flattenPoData(data) {
   }
 
   if (lineItemsHeaderIndex === -1) {
-    // Fallback: can't find line items structure, return as-is
-    return { headers: data[0] || [], rows: data.slice(1) };
+    return { metadata, lineItems: [] };
   }
 
-  // Get line items column headers
-  const lineItemHeaders = data[lineItemsHeaderIndex] || [];
-
-  // Create combined headers: metadata fields + line item fields
-  const metadataHeaders = ['PO_Number', 'Category', 'Order_Date', 'PO_Expiry', 'Supplier_Name', 'Payment_Term'];
-  const combinedHeaders = [...metadataHeaders, ...lineItemHeaders];
-
-  // Extract line items (rows after header until we hit summary/total row)
-  const lineItems = [];
+  // Extract line items (rows after header until summary row)
   for (let i = lineItemsHeaderIndex + 1; i < data.length; i++) {
     const row = data[i];
     if (!row || row.length === 0) continue;
 
-    // Line items have a numeric S.no. in first column
     const firstCell = row[0];
     if (typeof firstCell === 'number' || (typeof firstCell === 'string' && /^\d+$/.test(firstCell.trim()))) {
-      // This is a line item row - prepend metadata
-      const metadataValues = [
-        metadata.poNumber || '',
-        metadata.category || '',
-        metadata.orderDate || '',
-        metadata.poExpiry || '',
-        metadata.supplierName || '',
-        metadata.paymentTerm || ''
-      ];
-      const combinedRow = [...metadataValues, ...row];
-      lineItems.push(combinedRow);
+      // This is a line item row - store raw row data
+      lineItems.push(row);
     } else if (firstCell && (String(firstCell).includes('Total') || String(firstCell).includes('Important'))) {
       // Reached summary section, stop processing
       break;
     }
   }
 
-  return { headers: combinedHeaders, rows: lineItems };
+  return { metadata, lineItems };
 }
 
 /**
