@@ -8,6 +8,7 @@ import { mergeXlsFiles, generateMergedFilename, flattenAndMergePoFiles } from '.
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import { parse } from 'csv-parse/sync';
 
 export class FlipkartDownloadPOTask extends BaseTask {
   constructor(taskConfig) {
@@ -57,11 +58,20 @@ export class FlipkartDownloadPOTask extends BaseTask {
       return;
     }
 
-    // Step 4: Flatten and combine all downloaded files
-    const combinedFile = await this.combineFiles(downloadedFiles);
+    // Step 4: Download PO List CSV to get Origin Warehouse mapping
+    const csvPath = await this.downloadPOListCSV();
+    let warehouseMapping = new Map();
+    if (csvPath) {
+      warehouseMapping = this.parseWarehouseMapping(csvPath);
+    }
 
-    // Step 5: Cleanup temp files
-    this.cleanupTempFiles(downloadedFiles);
+    // Step 5: Flatten and combine all downloaded files
+    const combinedFile = await this.combineFiles(downloadedFiles, warehouseMapping);
+
+    // Step 6: Cleanup temp files (including CSV)
+    const filesToCleanup = [...downloadedFiles];
+    if (csvPath) filesToCleanup.push(csvPath);
+    this.cleanupTempFiles(filesToCleanup);
 
     console.log(`\n✅ Flipkart PO download completed!`);
     console.log(`📁 Combined file saved: ${combinedFile}\n`);
@@ -91,6 +101,106 @@ export class FlipkartDownloadPOTask extends BaseTask {
     console.log('⏳ Waiting for PO data to load...');
     await this.page.waitForTimeout(8000); // Wait longer for data to load
     console.log('✅ PO list page loaded');
+  }
+
+  /**
+   * Download the PO List CSV file (contains Origin Warehouse info)
+   * @returns {string|null} Path to downloaded CSV file, or null if failed
+   */
+  async downloadPOListCSV() {
+    console.log('\n📥 Downloading PO List CSV for warehouse mapping...');
+
+    try {
+      // Look for the "Download List" button
+      const downloadListSelectors = [
+        'button:has-text("Download List")',
+        'text=Download List',
+        '[role="button"]:has-text("Download List")',
+        'a:has-text("Download List")'
+      ];
+
+      let downloadBtn = null;
+      for (const selector of downloadListSelectors) {
+        try {
+          const btn = this.page.locator(selector).first();
+          const isVisible = await btn.isVisible({ timeout: 2000 }).catch(() => false);
+          if (isVisible) {
+            downloadBtn = btn;
+            console.log(`   Found "Download List" button with selector: ${selector}`);
+            break;
+          }
+        } catch (e) {
+          // Continue to next selector
+        }
+      }
+
+      if (!downloadBtn) {
+        console.log('⚠️  "Download List" button not found, skipping warehouse mapping');
+        return null;
+      }
+
+      // Set up download listener before clicking
+      const downloadPromise = this.page.waitForEvent('download', { timeout: 30000 });
+
+      // Click the download button
+      await downloadBtn.click();
+      console.log('   ⏳ Waiting for CSV download...');
+
+      // Wait for download to complete
+      const download = await downloadPromise;
+
+      // Get the suggested filename or generate one
+      let filename = download.suggestedFilename();
+      if (!filename) {
+        filename = `po_list_${Date.now()}.csv`;
+      }
+
+      // Save to temp directory
+      const filepath = path.join(this.tempDir, filename);
+      await download.saveAs(filepath);
+
+      console.log(`   ✅ Downloaded: ${filename}`);
+      return filepath;
+    } catch (error) {
+      console.log(`⚠️  Error downloading PO List CSV: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Parse warehouse mapping from the downloaded CSV
+   * @param {string} csvPath - Path to the CSV file
+   * @returns {Map<string, string>} Map of PO_Number → Origin_Warehouse
+   */
+  parseWarehouseMapping(csvPath) {
+    console.log('\n📊 Parsing warehouse mapping from CSV...');
+
+    try {
+      const csvContent = fs.readFileSync(csvPath, 'utf-8');
+      const records = parse(csvContent, {
+        columns: true,
+        skip_empty_lines: true,
+        relax_column_count: true
+      });
+
+      const warehouseMap = new Map();
+
+      for (const record of records) {
+        // Column names may vary, try common variations
+        const poNumber = record['Purchase Order ID'] || record['PO ID'] || record['PO Number'] || '';
+        const originWarehouse = record['Origin Warehouse'] || record['Warehouse'] || '';
+
+        if (poNumber && originWarehouse) {
+          warehouseMap.set(poNumber, originWarehouse);
+        }
+      }
+
+      console.log(`   ✅ Loaded ${warehouseMap.size} PO → Warehouse mappings`);
+      return warehouseMap;
+    } catch (error) {
+      console.log(`⚠️  Error parsing warehouse CSV: ${error.message}`);
+      return new Map();
+    }
   }
 
   /**
@@ -806,15 +916,17 @@ export class FlipkartDownloadPOTask extends BaseTask {
 
   /**
    * Flatten and combine all downloaded files into one
+   * @param {string[]} downloadedFiles - Array of downloaded file paths
+   * @param {Map<string, string>} warehouseMapping - Map of PO_Number → Origin_Warehouse
    */
-  async combineFiles(downloadedFiles) {
+  async combineFiles(downloadedFiles, warehouseMapping = new Map()) {
     console.log('\n📊 Flattening and combining downloaded files...');
 
     const outputFilename = generateMergedFilename('filflo_flipkart_po', '.xlsx');
     const outputPath = path.join(this.downloadPath, outputFilename);
 
     // Use flattenAndMergePoFiles to handle PO-specific flattening
-    const combinedFile = flattenAndMergePoFiles(downloadedFiles, outputPath);
+    const combinedFile = flattenAndMergePoFiles(downloadedFiles, outputPath, warehouseMapping);
     return combinedFile;
   }
 

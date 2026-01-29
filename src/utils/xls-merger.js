@@ -104,9 +104,10 @@ export function generateMergedFilename(prefix = 'combined_po', extension = '.xls
  *
  * @param {string[]} filePaths - Array of file paths to merge
  * @param {string} outputPath - Path for the merged output file
+ * @param {Map<string, string>} warehouseMap - Optional map of PO_Number → Origin_Warehouse
  * @returns {string} Path to the merged file
  */
-export function flattenAndMergePoFiles(filePaths, outputPath) {
+export function flattenAndMergePoFiles(filePaths, outputPath, warehouseMap = new Map()) {
   if (!filePaths || filePaths.length === 0) {
     throw new Error('No files provided to flatten and merge');
   }
@@ -114,7 +115,7 @@ export function flattenAndMergePoFiles(filePaths, outputPath) {
   console.log(`\n📊 Flattening and merging ${filePaths.length} PO file(s)...`);
 
   // Fixed metadata headers (always in this order)
-  const metadataHeaders = ['PO_Number', 'Category', 'Order_Date', 'PO_Expiry', 'Supplier_Name', 'Payment_Term'];
+  const metadataHeaders = ['PO_Number', 'Category', 'Order_Date', 'PO_Expiry', 'Supplier_Name', 'Payment_Term', 'Origin_Warehouse'];
 
   // PASS 1: Collect all unique line item headers from all files
   console.log(`   🔍 Pass 1: Scanning files for column headers...`);
@@ -200,13 +201,14 @@ export function flattenAndMergePoFiles(filePaths, outputPath) {
       // Create output row with all positions initialized to empty
       const outputRow = new Array(canonicalHeaders.length).fill('');
 
-      // Fill metadata positions (0-5)
+      // Fill metadata positions (0-6)
       outputRow[0] = metadata.poNumber || '';
       outputRow[1] = metadata.category || '';
       outputRow[2] = metadata.orderDate || '';
       outputRow[3] = metadata.poExpiry || '';
       outputRow[4] = metadata.supplierName || '';
       outputRow[5] = metadata.paymentTerm || '';
+      outputRow[6] = warehouseMap.get(metadata.poNumber) || '';
 
       // Fill line item positions using column mapping
       for (let srcIdx = 0; srcIdx < row.length; srcIdx++) {
