@@ -27,8 +27,8 @@ export class FlipkartDownloadPOTask extends BaseTask {
     try {
       const firstDataRow = this.page.locator('div[role="row"]').nth(1); // Skip header
       const rowText = await firstDataRow.textContent();
-      // Extract PO number pattern like "FLGWN07529757"
-      const poMatch = rowText.match(/[A-Z]{2,5}\d{8,}/);
+      // Extract PO number pattern like "FLGWN07529757" (2-5 letters + 8 digits)
+      const poMatch = rowText.match(/[A-Z]{2,5}\d{8}/);
       return poMatch ? poMatch[0] : null;
     } catch (e) {
       return null;
@@ -44,37 +44,100 @@ export class FlipkartDownloadPOTask extends BaseTask {
     // Ensure download directories exist
     this.ensureDirectoriesExist();
 
-    // Step 1: Navigate to PO list page
-    await this.navigateToPOList();
+    // Define statuses to process
+    const statuses = [
+      {
+        status: 'open',
+        label: 'Open',
+        url: 'https://vendorhub.flipkart.com/#/operations/po/list?status=open'
+      },
+      {
+        status: 'pending_acknowledgement',
+        label: 'Pending Ack',
+        url: 'https://vendorhub.flipkart.com/#/operations/po/list?status=pending_acknowledgement'
+      }
+    ];
 
-    // Step 2: Set pagination to 50 POs per page
-    // await this.setPaginationTo50();  // Skip for testing pagination with default 10 items
+    const allDownloadedFiles = []; // Array of { path, orderStatus }
+    let combinedWarehouseMap = new Map();
+    const allCsvPaths = [];
 
-    // Step 3: Download all individual PO files from each row (across all pages)
-    const downloadedFiles = await this.downloadAllPOsAcrossPages();
+    // Process each status page
+    for (const statusConfig of statuses) {
+      console.log(`\n${'='.repeat(60)}`);
+      console.log(`📂 Processing "${statusConfig.label}" POs...`);
+      console.log(`${'='.repeat(60)}`);
 
-    if (downloadedFiles.length === 0) {
-      console.log('\n⚠️  No PO files were downloaded');
+      const { files, warehouseMap, csvPath } = await this.downloadPOsForStatus(statusConfig);
+
+      // Accumulate files with status info
+      allDownloadedFiles.push(...files);
+
+      // Merge warehouse mappings
+      for (const [key, value] of warehouseMap) {
+        combinedWarehouseMap.set(key, value);
+      }
+
+      // Track CSV for cleanup
+      if (csvPath) {
+        allCsvPaths.push(csvPath);
+      }
+
+      console.log(`\n✅ Completed "${statusConfig.label}": ${files.length} file(s)`);
+    }
+
+    if (allDownloadedFiles.length === 0) {
+      console.log('\n⚠️  No PO files were downloaded from any status page');
       return;
     }
 
-    // Step 4: Download PO List CSV to get Origin Warehouse mapping
-    const csvPath = await this.downloadPOListCSV();
-    let warehouseMapping = new Map();
-    if (csvPath) {
-      warehouseMapping = this.parseWarehouseMapping(csvPath);
-    }
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`📊 Combining all ${allDownloadedFiles.length} PO files...`);
+    console.log(`${'='.repeat(60)}`);
 
-    // Step 5: Flatten and combine all downloaded files
-    const combinedFile = await this.combineFiles(downloadedFiles, warehouseMapping);
+    // Flatten and combine all downloaded files
+    const combinedFile = await this.combineFiles(allDownloadedFiles, combinedWarehouseMap);
 
-    // Step 6: Cleanup temp files (including CSV)
-    const filesToCleanup = [...downloadedFiles];
-    if (csvPath) filesToCleanup.push(csvPath);
+    // Cleanup temp files (including CSVs)
+    const filesToCleanup = [...allDownloadedFiles.map(f => f.path), ...allCsvPaths];
     this.cleanupTempFiles(filesToCleanup);
 
     console.log(`\n✅ Flipkart PO download completed!`);
     console.log(`📁 Combined file saved: ${combinedFile}\n`);
+  }
+
+  /**
+   * Download POs for a specific status page
+   * @param {Object} statusConfig - { status, label, url }
+   * @returns {Object} { files: Array<{path, orderStatus}>, warehouseMap: Map, csvPath: string|null }
+   */
+  async downloadPOsForStatus(statusConfig) {
+    const { label, url } = statusConfig;
+
+    // Navigate to status-specific PO list page
+    await this.navigateToPOList(url);
+
+    // Download PO List CSV for warehouse mapping
+    const csvPath = await this.downloadPOListCSV();
+    let warehouseMap = new Map();
+    if (csvPath) {
+      warehouseMap = this.parseWarehouseMapping(csvPath);
+    }
+
+    // Set pagination to 50 POs per page
+    await this.setPaginationTo50();
+
+    // Download all PO files from this status page
+    // Pass status to use appropriate download strategy (direct button vs kebab menu)
+    const downloadedPaths = await this.downloadAllPOsAcrossPages(statusConfig.status);
+
+    // Convert paths to file info objects with orderStatus
+    const files = downloadedPaths.map(filePath => ({
+      path: filePath,
+      orderStatus: label
+    }));
+
+    return { files, warehouseMap, csvPath };
   }
 
   /**
@@ -94,12 +157,13 @@ export class FlipkartDownloadPOTask extends BaseTask {
 
   /**
    * Navigate to PO list page
+   * @param {string} url - The URL to navigate to
    */
-  async navigateToPOList() {
-    console.log('🌐 Navigating to PO list page...');
-    await this.navigateTo('https://vendorhub.flipkart.com/#/operations/po/list?status=open');
+  async navigateToPOList(url) {
+    console.log(`🌐 Navigating to PO list page: ${url}`);
+    await this.navigateTo(url);
     console.log('⏳ Waiting for PO data to load...');
-    await this.page.waitForTimeout(8000); // Wait longer for data to load
+    await this.page.waitForTimeout(5000); // Wait for data to load
     console.log('✅ PO list page loaded');
   }
 
@@ -444,17 +508,38 @@ export class FlipkartDownloadPOTask extends BaseTask {
   async goToNextPage() {
     console.log('\n📄 Navigating to next page...');
 
-    // Capture first row PO number before clicking
+    // Get current page number from pagination text
+    const getCurrentPage = async () => {
+      try {
+        const pageText = await this.page.locator('text=/\\d+ of \\d+ pages/i').first().textContent();
+        const match = pageText.match(/(\d+)\s+of\s+(\d+)/i);
+        return match ? parseInt(match[1], 10) : null;
+      } catch (e) {
+        return null;
+      }
+    };
+
+    // Capture first row PO number and current page before clicking
     const poBefore = await this.getFirstRowPONumber();
-    console.log(`   Current first PO: ${poBefore || 'unknown'}`);
+    const pageBefore = await getCurrentPage();
+    console.log(`   Current first PO: ${poBefore || 'unknown'}, Page: ${pageBefore || 'unknown'}`);
 
     // Helper to verify content actually changed after clicking
     const verifyContentChanged = async () => {
       for (let i = 0; i < 10; i++) {
         await this.page.waitForTimeout(1000);
+
+        // Check if page number changed
+        const pageAfter = await getCurrentPage();
+        if (pageAfter && pageBefore && pageAfter > pageBefore) {
+          console.log(`   ✅ Page changed: ${pageBefore} → ${pageAfter}`);
+          return true;
+        }
+
+        // Also check if first PO changed
         const poAfter = await this.getFirstRowPONumber();
-        if (poAfter && poAfter !== poBefore) {
-          console.log(`   ✅ Page content changed: ${poBefore} → ${poAfter}`);
+        if (poAfter && poBefore && poAfter !== poBefore) {
+          console.log(`   ✅ Content changed: ${poBefore} → ${poAfter}`);
           return true;
         }
       }
@@ -499,34 +584,61 @@ export class FlipkartDownloadPOTask extends BaseTask {
       console.log(`   ">" button search error: ${e.message}`);
     }
 
-    // Approach 2: Find pagination controls by inspecting DOM near "X of Y pages"
+    // Approach 2: Find the "angle-right" SVG icon and click its parent container
+    try {
+      // Look for SVG with icon="angle-right" attribute
+      const nextSvg = this.page.locator('svg[icon="angle-right"]').first();
+      const isVisible = await nextSvg.isVisible({ timeout: 2000 }).catch(() => false);
+
+      if (isVisible) {
+        // Check if it's disabled
+        const isDisabled = await nextSvg.getAttribute('disabled');
+        if (isDisabled === null || isDisabled === undefined) {
+          // Click the parent div container (the actual clickable element)
+          const parentDiv = nextSvg.locator('xpath=ancestor::div[1]').first();
+          console.log('   Found angle-right SVG, clicking parent container...');
+          await parentDiv.scrollIntoViewIfNeeded();
+          await parentDiv.click({ force: true });
+          console.log('   ⏳ Waiting for page content to change...');
+          return await verifyContentChanged();
+        } else {
+          console.log('   angle-right SVG is disabled (last page)');
+        }
+      }
+    } catch (e) {
+      console.log(`   angle-right SVG search error: ${e.message}`);
+    }
+
+    // Approach 2b: Find pagination controls by inspecting DOM near "X of Y pages"
     try {
       // Look for the pagination text "X of Y pages"
       const paginationText = this.page.locator('text=/\\d+ of \\d+ pages/i').first();
       const isVisible = await paginationText.isVisible({ timeout: 2000 }).catch(() => false);
 
       if (isVisible) {
-        // Go up to a reasonable parent container and log its structure
+        // Go up to a reasonable parent container
         const grandParent = paginationText.locator('xpath=ancestor::div[3]').first();
-        const html = await grandParent.evaluate(el => el.outerHTML).catch(() => '');
-        console.log(`   Pagination area HTML (truncated):\n${html.substring(0, 1000)}`);
 
         // Try to find SVG elements (likely the arrow icons)
         const svgs = grandParent.locator('svg');
         const svgCount = await svgs.count();
-        console.log(`   Found ${svgCount} SVG elements`);
+        console.log(`   Found ${svgCount} SVG elements in pagination area`);
 
         // The last SVG is likely the ">" next button
         if (svgCount >= 2) {
-          // Assume layout is [<] [current] [>], so last SVG is next
           const nextSvg = svgs.last();
-          const parent = nextSvg.locator('xpath=ancestor::*[self::button or self::div or self::span][1]').first();
 
-          console.log('   Clicking on next button (last SVG parent)...');
-          await parent.scrollIntoViewIfNeeded();
-          await parent.click({ force: true });
-          console.log('   ⏳ Waiting for page content to change...');
-          return await verifyContentChanged();
+          // Check if disabled
+          const isDisabled = await nextSvg.getAttribute('disabled');
+          if (isDisabled === null || isDisabled === undefined) {
+            console.log('   Clicking on last SVG (next button)...');
+            await nextSvg.scrollIntoViewIfNeeded();
+            await nextSvg.click({ force: true });
+            console.log('   ⏳ Waiting for page content to change...');
+            return await verifyContentChanged();
+          } else {
+            console.log('   Last SVG is disabled');
+          }
         }
       }
     } catch (e) {
@@ -583,9 +695,10 @@ export class FlipkartDownloadPOTask extends BaseTask {
 
   /**
    * Download all POs across all pages
+   * @param {string} status - The PO status page type ('open' or 'pending_acknowledgement')
    * @returns {string[]} Array of downloaded file paths
    */
-  async downloadAllPOsAcrossPages() {
+  async downloadAllPOsAcrossPages(status = 'open') {
     console.log('\n🔄 Starting multi-page PO download...');
 
     const allDownloadedFiles = [];
@@ -615,7 +728,8 @@ export class FlipkartDownloadPOTask extends BaseTask {
       // Download POs from current page
       const { downloadedFiles, downloadedCount } = await this.downloadPOsFromCurrentPage(
         totalDownloaded,
-        remainingToDownload
+        remainingToDownload,
+        status
       );
 
       allDownloadedFiles.push(...downloadedFiles);
@@ -654,9 +768,10 @@ export class FlipkartDownloadPOTask extends BaseTask {
    * Download POs from the current page
    * @param {number} totalDownloadedSoFar - Count of POs already downloaded from previous pages
    * @param {number} remainingToDownload - Maximum number to download from this page
+   * @param {string} status - The PO status page type ('open' or 'pending_acknowledgement')
    * @returns {{ downloadedFiles: string[], downloadedCount: number }}
    */
-  async downloadPOsFromCurrentPage(totalDownloadedSoFar = 0, remainingToDownload = Infinity) {
+  async downloadPOsFromCurrentPage(totalDownloadedSoFar = 0, remainingToDownload = Infinity, status = 'open') {
     console.log('\n🔍 Looking for PO table rows...');
 
     const downloadedFiles = [];
@@ -668,7 +783,7 @@ export class FlipkartDownloadPOTask extends BaseTask {
 
     for (let retry = 0; retry < maxRetries; retry++) {
       console.log(`⏳ Waiting for table data to load (attempt ${retry + 1}/${maxRetries})...`);
-      await this.page.waitForTimeout(5000);
+      await this.page.waitForTimeout(3000);
 
       // Check row count with primary selector
       rowCount = await this.page.locator(rowSelector).count();
@@ -737,46 +852,15 @@ export class FlipkartDownloadPOTask extends BaseTask {
         // Get the row
         const row = this.page.locator(rowSelector).nth(rowIndex);
 
-        // Find the Download button in this row's action column
-        // Try multiple selectors for the download button
+        // Find the Download button - strategy depends on status page type
         let downloadBtn = null;
-        const buttonSelectors = [
-          'button:has-text("Download")',
-          'a:has-text("Download")',
-          '[role="button"]:has-text("Download")',
-          'text=Download',
-          'span:has-text("Download")',
-          'div:has-text("Download")',
-          'button[title*="download" i]',
-          'a[title*="download" i]',
-          '[class*="download" i]'
-        ];
 
-        for (const selector of buttonSelectors) {
-          try {
-            const btn = row.locator(selector).first();
-            const isVisible = await btn.isVisible({ timeout: 500 }).catch(() => false);
-            if (isVisible) {
-              downloadBtn = btn;
-              console.log(`   Found button with selector: ${selector}`);
-              break;
-            }
-          } catch (e) {
-            // Continue to next selector
-          }
-        }
-
-        if (!downloadBtn) {
-          // Try to find any clickable element with "Download" text in the row
-          const allElements = await row.locator('*').all();
-          for (const el of allElements) {
-            const text = await el.textContent().catch(() => '');
-            if (text && text.trim().toLowerCase() === 'download') {
-              downloadBtn = el;
-              console.log(`   Found button via text search`);
-              break;
-            }
-          }
+        if (status === 'pending_acknowledgement') {
+          // For pending ack: click kebab menu first, then find Download in dropdown
+          downloadBtn = await this.findDownloadInKebabMenu(row);
+        } else {
+          // For open: use direct Download button
+          downloadBtn = await this.findDirectDownloadButton(row);
         }
 
         if (!downloadBtn) {
@@ -807,7 +891,7 @@ export class FlipkartDownloadPOTask extends BaseTask {
         console.log(`✅ Downloaded: ${filename}`);
 
         // Brief pause between downloads
-        await this.page.waitForTimeout(1500);
+        await this.page.waitForTimeout(1000);
 
       } catch (error) {
         console.error(`❌ Error downloading PO ${i + 1}: ${error.message}`);
@@ -816,6 +900,236 @@ export class FlipkartDownloadPOTask extends BaseTask {
 
     console.log(`\n📊 Downloaded ${downloadedFiles.length}/${totalRows} file(s) from this page`);
     return { downloadedFiles, downloadedCount: downloadedFiles.length };
+  }
+
+  /**
+   * Find direct Download button within a row (used for "Open" status POs)
+   * @param {Locator} row - The row locator
+   * @returns {Locator|null} The download button locator or null if not found
+   */
+  async findDirectDownloadButton(row) {
+    const buttonSelectors = [
+      'button:has-text("Download")',
+      'a:has-text("Download")',
+      '[role="button"]:has-text("Download")',
+      'text=Download',
+      'span:has-text("Download")',
+      'div:has-text("Download")',
+      'button[title*="download" i]',
+      'a[title*="download" i]',
+      '[class*="download" i]'
+    ];
+
+    for (const selector of buttonSelectors) {
+      try {
+        const btn = row.locator(selector).first();
+        const isVisible = await btn.isVisible({ timeout: 500 }).catch(() => false);
+        if (isVisible) {
+          console.log(`   Found Download button`);
+          return btn;
+        }
+      } catch (e) {
+        // Continue to next selector
+      }
+    }
+
+    // Fallback: Try to find any clickable element with "Download" text in the row
+    try {
+      const allElements = await row.locator('*').all();
+      for (const el of allElements) {
+        const text = await el.textContent().catch(() => '');
+        if (text && text.trim().toLowerCase() === 'download') {
+          console.log(`   Found Download button`);
+          return el;
+        }
+      }
+    } catch (e) {
+      // Continue
+    }
+
+    return null;
+  }
+
+  /**
+   * Find Download option in kebab/three-dots menu (used for "Pending Acknowledgement" status POs)
+   * For these POs, the Download button is hidden in a dropdown menu accessed via ":" button
+   * @param {Locator} row - The row locator
+   * @returns {Locator|null} The download option locator or null if not found
+   */
+  async findDownloadInKebabMenu(row) {
+    // Try to find the kebab menu button (three-dots/vertical ellipsis icon)
+    // On Flipkart Vendor Hub, it's an SVG with icon="more-v" inside a clickable div
+    const kebabSelectors = [
+      'svg[icon="more-v"]',                      // SVG with more-v icon attribute
+      '[class*="ActionStyles__Icon"]',           // Action icon class
+      'div:has(> svg[icon="more-v"])',           // Div containing more-v SVG
+      'button:has-text(":")',                    // Button with : text
+      'button:has-text("⋮")',                    // Vertical ellipsis
+      '[aria-label*="more" i]',                  // Aria label for more options
+      '[aria-label*="options" i]',               // Aria label for options
+      '[aria-label*="menu" i]',                  // Aria label for menu
+      '[class*="kebab" i]',                      // Class containing kebab
+      '[class*="overflow" i]',                   // Class containing overflow
+      'button:has(svg):not(:has-text("Acknowledge"))'  // Button with SVG (icon) that's not Acknowledge
+    ];
+
+    let kebabBtn = null;
+    for (const selector of kebabSelectors) {
+      try {
+        // Get all matching elements in the row and take the last one
+        // (kebab is usually after other action buttons)
+        const btns = row.locator(selector);
+        const count = await btns.count();
+        if (count > 0) {
+          let btn = btns.last();
+          const isVisible = await btn.isVisible({ timeout: 500 }).catch(() => false);
+          if (isVisible) {
+            // If we found an SVG, get its parent div which is the clickable element
+            const tagName = await btn.evaluate(el => el.tagName.toLowerCase()).catch(() => '');
+            if (tagName === 'svg') {
+              btn = btn.locator('xpath=..');  // Get parent element
+            }
+            kebabBtn = btn;
+            console.log(`   Found kebab menu`);
+            break;
+          }
+        }
+      } catch (e) {
+        // Continue to next selector
+      }
+    }
+
+    if (!kebabBtn) {
+      // Fallback: Try finding any button in the row that's not Acknowledge
+      try {
+        const buttons = row.locator('button');
+        const count = await buttons.count();
+
+        for (let i = 0; i < count; i++) {
+          const btn = buttons.nth(i);
+          const text = await btn.textContent().catch(() => '');
+
+          // Skip Acknowledge button, look for short/empty text buttons (likely icons)
+          const trimmedText = text?.trim() || '';
+          if (!trimmedText.toLowerCase().includes('acknowledge') &&
+              !trimmedText.toLowerCase().includes('download') &&
+              trimmedText.length <= 5) {
+            const isVisible = await btn.isVisible({ timeout: 300 }).catch(() => false);
+            if (isVisible) {
+              kebabBtn = btn;
+              break;
+            }
+          }
+        }
+      } catch (e) {
+        // Continue
+      }
+    }
+
+    // Also try looking for div or span elements that might be clickable menu triggers
+    if (!kebabBtn) {
+      try {
+        const clickables = row.locator('div[role="button"], span[role="button"], [class*="click"]');
+        const count = await clickables.count();
+        for (let i = 0; i < count; i++) {
+          const el = clickables.nth(i);
+          const text = await el.textContent().catch(() => '');
+          if (!text || text.trim().length <= 3) {
+            const isVisible = await el.isVisible({ timeout: 300 }).catch(() => false);
+            if (isVisible) {
+              kebabBtn = el;
+              console.log(`   Found clickable element as kebab at index ${i}`);
+              break;
+            }
+          }
+        }
+      } catch (e) {
+        // Continue
+      }
+    }
+
+    if (!kebabBtn) {
+      console.log(`   Could not find kebab menu in row`);
+      return null;
+    }
+
+    // Click kebab button to open dropdown menu
+    try {
+      await kebabBtn.click();
+      console.log(`   Clicked kebab menu, waiting for dropdown...`);
+      await this.page.waitForTimeout(500);
+
+      // Wait for dropdown/popover to appear
+      // Flipkart uses a popover/portal that appears in the DOM
+      const dropdownSelectors = [
+        '[class*="Popover"]',
+        '[class*="popover"]',
+        '[class*="Dropdown"]',
+        '[class*="dropdown"]',
+        '[class*="Menu"]:not([class*="MenuBar"])',
+        '[role="menu"]',
+        '[role="listbox"]'
+      ];
+
+      let dropdown = null;
+      for (const selector of dropdownSelectors) {
+        try {
+          const el = this.page.locator(selector).last();
+          const isVisible = await el.isVisible({ timeout: 1000 }).catch(() => false);
+          if (isVisible) {
+            dropdown = el;
+            break;
+          }
+        } catch (e) {
+          // Continue
+        }
+      }
+
+      // Find "Download" option - prefer within dropdown, fallback to page-level
+      let downloadOption = null;
+
+      if (dropdown) {
+        // Look for Download within the dropdown
+        const downloadInDropdown = dropdown.locator('text=Download').first();
+        const isVisible = await downloadInDropdown.isVisible({ timeout: 500 }).catch(() => false);
+        if (isVisible) {
+          downloadOption = downloadInDropdown;
+        }
+      }
+
+      // Fallback: Look for any visible Download text that's NOT the "Download List" button
+      if (!downloadOption) {
+        const allDownloads = this.page.locator('text=Download');
+        const count = await allDownloads.count();
+
+        for (let i = 0; i < count; i++) {
+          const el = allDownloads.nth(i);
+          const text = await el.textContent().catch(() => '');
+          const isVisible = await el.isVisible({ timeout: 200 }).catch(() => false);
+
+          // Skip "Download List" button, we want just "Download"
+          if (isVisible && text && text.trim() === 'Download') {
+            downloadOption = el;
+            break;
+          }
+        }
+      }
+
+      if (downloadOption) {
+        console.log(`   Found Download in menu`);
+        return downloadOption;
+      }
+
+      // If no Download found, close the dropdown
+      console.log(`   Download option not found in menu, closing...`);
+      await this.page.keyboard.press('Escape');
+      await this.page.waitForTimeout(300);
+
+    } catch (e) {
+      console.log(`   Error opening kebab menu: ${e.message}`);
+    }
+
+    return null;
   }
 
   /**
@@ -916,7 +1230,7 @@ export class FlipkartDownloadPOTask extends BaseTask {
 
   /**
    * Flatten and combine all downloaded files into one
-   * @param {string[]} downloadedFiles - Array of downloaded file paths
+   * @param {Array<{path: string, orderStatus: string}>} downloadedFiles - Array of file info objects
    * @param {Map<string, string>} warehouseMapping - Map of PO_Number → Origin_Warehouse
    */
   async combineFiles(downloadedFiles, warehouseMapping = new Map()) {
@@ -926,6 +1240,7 @@ export class FlipkartDownloadPOTask extends BaseTask {
     const outputPath = path.join(this.downloadPath, outputFilename);
 
     // Use flattenAndMergePoFiles to handle PO-specific flattening
+    // Pass file info objects with path and orderStatus
     const combinedFile = flattenAndMergePoFiles(downloadedFiles, outputPath, warehouseMapping);
     return combinedFile;
   }
