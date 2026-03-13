@@ -117,12 +117,8 @@ export class FlipkartDownloadPOTask extends BaseTask {
     // Navigate to status-specific PO list page
     await this.navigateToPOList(url);
 
-    // Download PO List CSV for warehouse mapping
-    const csvPath = await this.downloadPOListCSV();
-    let warehouseMap = new Map();
-    if (csvPath) {
-      warehouseMap = this.parseWarehouseMapping(csvPath);
-    }
+    // Start CSV download in background (don't block on it)
+    const csvDownloadPromise = await this.startCSVDownloadInBackground();
 
     // Set pagination to 50 POs per page
     await this.setPaginationTo50();
@@ -130,6 +126,15 @@ export class FlipkartDownloadPOTask extends BaseTask {
     // Download all PO files from this status page
     // Pass status to use appropriate download strategy (direct button vs kebab menu)
     const downloadedPaths = await this.downloadAllPOsAcrossPages(statusConfig.status);
+
+    // Now collect the CSV download result (wait up to 2 minutes)
+    let warehouseMap = new Map();
+    let csvPath = null;
+    if (csvDownloadPromise) {
+      const result = await this.collectCSVDownload(csvDownloadPromise);
+      csvPath = result.csvPath;
+      warehouseMap = result.warehouseMap;
+    }
 
     // Convert paths to file info objects with orderStatus
     const files = downloadedPaths.map(filePath => ({
@@ -168,14 +173,13 @@ export class FlipkartDownloadPOTask extends BaseTask {
   }
 
   /**
-   * Download the PO List CSV file (contains Origin Warehouse info)
-   * @returns {string|null} Path to downloaded CSV file, or null if failed
+   * Start CSV download in background (click "Download List" button, don't wait for completion)
+   * @returns {Promise|null} Download promise that resolves when CSV is ready, or null if button not found
    */
-  async downloadPOListCSV() {
-    console.log('\n📥 Downloading PO List CSV for warehouse mapping...');
+  async startCSVDownloadInBackground() {
+    console.log('\n📥 Starting "Download List" CSV download (background)...');
 
     try {
-      // Look for the "Download List" button
       const downloadListSelectors = [
         'button:has-text("Download List")',
         'text=Download List',
@@ -190,11 +194,10 @@ export class FlipkartDownloadPOTask extends BaseTask {
           const isVisible = await btn.isVisible({ timeout: 2000 }).catch(() => false);
           if (isVisible) {
             downloadBtn = btn;
-            console.log(`   Found "Download List" button with selector: ${selector}`);
             break;
           }
         } catch (e) {
-          // Continue to next selector
+          continue;
         }
       }
 
@@ -203,32 +206,53 @@ export class FlipkartDownloadPOTask extends BaseTask {
         return null;
       }
 
-      // Set up download listener before clicking
-      const downloadPromise = this.page.waitForEvent('download', { timeout: 30000 });
+      // Set up download listener with CSV predicate (2-minute timeout)
+      const csvDownloadPromise = this.page.waitForEvent('download', {
+        timeout: 120000,
+        predicate: (d) => {
+          const name = d.suggestedFilename();
+          return name && name.endsWith('.csv');
+        }
+      });
 
-      // Click the download button
       await downloadBtn.click();
-      console.log('   ⏳ Waiting for CSV download...');
+      console.log('   📥 "Download List" clicked, downloading in background...');
 
-      // Wait for download to complete
-      const download = await downloadPromise;
+      return csvDownloadPromise;
+    } catch (error) {
+      console.log(`⚠️  Error starting CSV download: ${error.message}`);
+      return null;
+    }
+  }
 
-      // Get the suggested filename or generate one
+  /**
+   * Collect the CSV download result and parse warehouse mapping
+   * @param {Promise} csvDownloadPromise - Promise from startCSVDownloadInBackground
+   * @returns {{ csvPath: string|null, warehouseMap: Map }}
+   */
+  async collectCSVDownload(csvDownloadPromise) {
+    let csvPath = null;
+    let warehouseMap = new Map();
+
+    try {
+      console.log('\n📥 Collecting "Download List" CSV...');
+      const download = await csvDownloadPromise;
+
       let filename = download.suggestedFilename();
       if (!filename) {
         filename = `po_list_${Date.now()}.csv`;
       }
 
-      // Save to temp directory
-      const filepath = path.join(this.tempDir, filename);
-      await download.saveAs(filepath);
+      csvPath = path.join(this.tempDir, filename);
+      await download.saveAs(csvPath);
+      console.log(`   ✅ CSV downloaded: ${filename}`);
 
-      console.log(`   ✅ Downloaded: ${filename}`);
-      return filepath;
+      warehouseMap = this.parseWarehouseMapping(csvPath);
     } catch (error) {
-      console.log(`⚠️  Error downloading PO List CSV: ${error.message}`);
-      return null;
+      console.log('⚠️  CSV download timed out or failed, continuing without warehouse mapping');
     }
+
+    return { csvPath, warehouseMap };
   }
 
   /**
@@ -502,7 +526,9 @@ export class FlipkartDownloadPOTask extends BaseTask {
   }
 
   /**
-   * Click "Next" button and wait for table content to actually change
+   * Click "Next" button and wait for table content to actually change.
+   * Flipkart Vendor Hub pagination structure:
+   *   [combobox (items/page)] ["|"] ["X of Y pages"] [prev arrow img/svg] [page input] [next arrow img/svg]
    * @returns {boolean} True if navigation succeeded and content changed
    */
   async goToNextPage() {
@@ -513,180 +539,94 @@ export class FlipkartDownloadPOTask extends BaseTask {
       try {
         const pageText = await this.page.locator('text=/\\d+ of \\d+ pages/i').first().textContent();
         const match = pageText.match(/(\d+)\s+of\s+(\d+)/i);
-        return match ? parseInt(match[1], 10) : null;
+        return match ? { current: parseInt(match[1], 10), total: parseInt(match[2], 10) } : null;
       } catch (e) {
         return null;
       }
     };
 
-    // Capture first row PO number and current page before clicking
-    const poBefore = await this.getFirstRowPONumber();
     const pageBefore = await getCurrentPage();
-    console.log(`   Current first PO: ${poBefore || 'unknown'}, Page: ${pageBefore || 'unknown'}`);
+    if (!pageBefore) {
+      console.log('   ⚠️ Could not determine current page');
+      return false;
+    }
+    console.log(`   Current page: ${pageBefore.current} of ${pageBefore.total}`);
 
-    // Helper to verify content actually changed after clicking
-    const verifyContentChanged = async () => {
+    if (pageBefore.current >= pageBefore.total) {
+      console.log('   ℹ️ Already on last page');
+      return false;
+    }
+
+    const targetPage = pageBefore.current + 1;
+
+    // Helper to wait for page number to change
+    const waitForPageChange = async () => {
       for (let i = 0; i < 10; i++) {
         await this.page.waitForTimeout(1000);
-
-        // Check if page number changed
         const pageAfter = await getCurrentPage();
-        if (pageAfter && pageBefore && pageAfter > pageBefore) {
-          console.log(`   ✅ Page changed: ${pageBefore} → ${pageAfter}`);
-          return true;
-        }
-
-        // Also check if first PO changed
-        const poAfter = await this.getFirstRowPONumber();
-        if (poAfter && poBefore && poAfter !== poBefore) {
-          console.log(`   ✅ Content changed: ${poBefore} → ${poAfter}`);
+        if (pageAfter && pageAfter.current === targetPage) {
+          console.log(`   ✅ Page changed: ${pageBefore.current} → ${pageAfter.current}`);
           return true;
         }
       }
-      console.log('   ⚠️ Page content did not change after 10 seconds');
+      console.log('   ⚠️ Page did not change after 10 seconds');
       return false;
     };
 
-    // Approach 1: Use Playwright's text locator for ">" button
+    // Approach 1: Type page number into the page input textbox
+    // The textbox is a sibling of the "X of Y pages" text in the pagination area
     try {
-      // Try multiple selectors for the next button
-      const nextSelectors = [
-        'button:has-text(">")',           // Button containing >
-        'span:text-is(">")',              // Span with exact >
-        'div:text-is(">")',               // Div with exact >
-        '[role="button"]:has-text(">")',  // Role button containing >
-      ];
-
-      for (const selector of nextSelectors) {
-        const btn = this.page.locator(selector).first();
-        const isVisible = await btn.isVisible({ timeout: 1000 }).catch(() => false);
-
-        if (isVisible) {
-          const isDisabled = await btn.evaluate(node => {
-            return node.disabled ||
-                   node.classList.contains('disabled') ||
-                   node.getAttribute('aria-disabled') === 'true' ||
-                   node.style.opacity === '0.5';
-          }).catch(() => false);
-
-          if (!isDisabled) {
-            console.log(`   Found ">" via "${selector}", clicking...`);
-            await btn.click();
-            console.log('   ⏳ Waiting for page content to change...');
-            return await verifyContentChanged();
-          } else {
-            console.log(`   Found ">" via "${selector}" but it's disabled`);
-          }
-        }
-      }
-      console.log('   No ">" button found via text selectors');
-    } catch (e) {
-      console.log(`   ">" button search error: ${e.message}`);
-    }
-
-    // Approach 2: Find the "angle-right" SVG icon and click its parent container
-    try {
-      // Look for SVG with icon="angle-right" attribute
-      const nextSvg = this.page.locator('svg[icon="angle-right"]').first();
-      const isVisible = await nextSvg.isVisible({ timeout: 2000 }).catch(() => false);
-
-      if (isVisible) {
-        // Check if it's disabled
-        const isDisabled = await nextSvg.getAttribute('disabled');
-        if (isDisabled === null || isDisabled === undefined) {
-          // Click the parent div container (the actual clickable element)
-          const parentDiv = nextSvg.locator('xpath=ancestor::div[1]').first();
-          console.log('   Found angle-right SVG, clicking parent container...');
-          await parentDiv.scrollIntoViewIfNeeded();
-          await parentDiv.click({ force: true });
-          console.log('   ⏳ Waiting for page content to change...');
-          return await verifyContentChanged();
-        } else {
-          console.log('   angle-right SVG is disabled (last page)');
-        }
-      }
-    } catch (e) {
-      console.log(`   angle-right SVG search error: ${e.message}`);
-    }
-
-    // Approach 2b: Find pagination controls by inspecting DOM near "X of Y pages"
-    try {
-      // Look for the pagination text "X of Y pages"
       const paginationText = this.page.locator('text=/\\d+ of \\d+ pages/i').first();
-      const isVisible = await paginationText.isVisible({ timeout: 2000 }).catch(() => false);
+      const container = paginationText.locator('xpath=..');
+      const pageInput = container.locator('input').first();
+      const isVisible = await pageInput.isVisible({ timeout: 2000 }).catch(() => false);
 
       if (isVisible) {
-        // Go up to a reasonable parent container
-        const grandParent = paginationText.locator('xpath=ancestor::div[3]').first();
+        console.log(`   Typing page ${targetPage} into page input...`);
+        await pageInput.click({ clickCount: 3 }); // Select all text
+        await pageInput.fill(String(targetPage));
+        await pageInput.press('Enter');
+        return await waitForPageChange();
+      }
+    } catch (e) {
+      console.log(`   Page input approach failed: ${e.message}`);
+    }
 
-        // Try to find SVG elements (likely the arrow icons)
-        const svgs = grandParent.locator('svg');
-        const svgCount = await svgs.count();
-        console.log(`   Found ${svgCount} SVG elements in pagination area`);
+    // Approach 2: Click the next arrow (last SVG in the pagination area)
+    try {
+      const paginationText = this.page.locator('text=/\\d+ of \\d+ pages/i').first();
+      const container = paginationText.locator('xpath=..');
+      const svgs = container.locator('svg');
+      const svgCount = await svgs.count();
 
-        // The last SVG is likely the ">" next button
-        if (svgCount >= 2) {
-          const nextSvg = svgs.last();
+      if (svgCount >= 2) {
+        const nextArrow = svgs.last();
+        console.log('   Clicking next arrow SVG...');
+        await nextArrow.scrollIntoViewIfNeeded();
+        await nextArrow.click();
+        return await waitForPageChange();
+      }
+    } catch (e) {
+      console.log(`   Next arrow click failed: ${e.message}`);
+    }
 
-          // Check if disabled
-          const isDisabled = await nextSvg.getAttribute('disabled');
-          if (isDisabled === null || isDisabled === undefined) {
-            console.log('   Clicking on last SVG (next button)...');
-            await nextSvg.scrollIntoViewIfNeeded();
-            await nextSvg.click({ force: true });
-            console.log('   ⏳ Waiting for page content to change...');
-            return await verifyContentChanged();
-          } else {
-            console.log('   Last SVG is disabled');
-          }
-        }
+    // Approach 3: Click the next arrow via parent container with broader search
+    try {
+      const paginationText = this.page.locator('text=/\\d+ of \\d+ pages/i').first();
+      const grandParent = paginationText.locator('xpath=ancestor::div[2]').first();
+      const svgs = grandParent.locator('svg');
+      const svgCount = await svgs.count();
+      console.log(`   Found ${svgCount} SVG elements in pagination area`);
+
+      if (svgCount >= 2) {
+        const nextArrow = svgs.last();
+        console.log('   Clicking last SVG in pagination area...');
+        await nextArrow.scrollIntoViewIfNeeded();
+        await nextArrow.click();
+        return await waitForPageChange();
       }
     } catch (e) {
       console.log(`   Pagination area search error: ${e.message}`);
-    }
-
-    // Approach 3: Click directly on ">" text anywhere on page
-    try {
-      const nextArrow = this.page.locator('button >> text=">"').first();
-      const isVisible = await nextArrow.isVisible({ timeout: 1000 }).catch(() => false);
-      if (isVisible) {
-        console.log('   Found ">" via text locator, clicking...');
-        await nextArrow.click();
-        console.log('   ⏳ Waiting for page content to change...');
-        return await verifyContentChanged();
-      }
-    } catch (e) {
-      // Continue
-    }
-
-    // Approach 4: Try various CSS selectors
-    const nextButtonSelectors = [
-      'button:has-text("Next")',
-      '[aria-label="Next page"]',
-      '[aria-label="next page"]',
-      '[aria-label="Go to next page"]',
-      '[class*="pagination"] button:last-of-type',
-      '[class*="pager"] button:last-of-type'
-    ];
-
-    for (const selector of nextButtonSelectors) {
-      try {
-        const button = this.page.locator(selector).first();
-        const isVisible = await button.isVisible({ timeout: 500 }).catch(() => false);
-
-        if (isVisible) {
-          const isDisabled = await button.evaluate(el => el.disabled).catch(() => false);
-
-          if (!isDisabled) {
-            console.log(`   Clicking: ${selector}`);
-            await button.click();
-            console.log('   ⏳ Waiting for page content to change...');
-            return await verifyContentChanged();
-          }
-        }
-      } catch (e) {
-        // Continue to next selector
-      }
     }
 
     console.log('⚠️  Could not find or click Next button');
@@ -868,8 +808,11 @@ export class FlipkartDownloadPOTask extends BaseTask {
           continue;
         }
 
-        // Set up download listener before clicking
-        const downloadPromise = this.page.waitForEvent('download', { timeout: 30000 });
+        // Set up download listener before clicking (exclude CSV files from background Download List)
+        const downloadPromise = this.page.waitForEvent('download', {
+          timeout: 30000,
+          predicate: (d) => !d.suggestedFilename()?.endsWith('.csv')
+        });
 
         // Click the download button
         await downloadBtn.click();
@@ -899,6 +842,17 @@ export class FlipkartDownloadPOTask extends BaseTask {
     }
 
     console.log(`\n📊 Downloaded ${downloadedFiles.length}/${totalRows} file(s) from this page`);
+
+    // Fallback: if row-based approach downloaded nothing for Open POs, try direct link approach
+    if (downloadedFiles.length === 0 && status !== 'pending_acknowledgement') {
+      console.log('\n🔄 Row-based download found no files, trying direct Download links...');
+      const directResult = await this.downloadPOsViaDirectLinks(
+        totalDownloadedSoFar,
+        remainingToDownload
+      );
+      downloadedFiles.push(...directResult.downloadedFiles);
+    }
+
     return { downloadedFiles, downloadedCount: downloadedFiles.length };
   }
 
@@ -948,6 +902,85 @@ export class FlipkartDownloadPOTask extends BaseTask {
     }
 
     return null;
+  }
+
+  /**
+   * Download POs by finding "Download" links directly on the page (fallback for Open POs)
+   * Used when row-based detection fails due to different table DOM structure
+   */
+  async downloadPOsViaDirectLinks(totalDownloadedSoFar = 0, remainingToDownload = Infinity) {
+    const downloadedFiles = [];
+
+    // Find all elements with exact text "Download" (excludes "Download List")
+    const downloadLinks = this.page.getByText('Download', { exact: true });
+    let count = await downloadLinks.count();
+
+    // Filter out any links that might be part of "Download List" button
+    const validIndices = [];
+    for (let i = 0; i < count; i++) {
+      try {
+        const el = downloadLinks.nth(i);
+        const parentText = await el.evaluate(node => {
+          // Check up to 2 parent levels for "Download List" text
+          let current = node.parentElement;
+          for (let j = 0; j < 2; j++) {
+            if (current && current.textContent.includes('Download List')) return 'skip';
+            current = current?.parentElement;
+          }
+          return 'ok';
+        });
+        if (parentText === 'ok') {
+          validIndices.push(i);
+        }
+      } catch (e) {
+        continue;
+      }
+    }
+
+    console.log(`📊 Found ${validIndices.length} Download links on page`);
+
+    if (validIndices.length === 0) {
+      return { downloadedFiles: [], downloadedCount: 0 };
+    }
+
+    const toDownload = Math.min(validIndices.length, remainingToDownload);
+
+    for (let i = 0; i < toDownload; i++) {
+      const globalIndex = totalDownloadedSoFar + downloadedFiles.length + 1;
+      console.log(`📥 Downloading PO ${globalIndex} (link ${i + 1}/${toDownload})...`);
+
+      try {
+        const link = downloadLinks.nth(validIndices[i]);
+
+        // Scroll into view
+        await link.scrollIntoViewIfNeeded();
+
+        // Set up download listener (exclude CSV files from background Download List)
+        const downloadPromise = this.page.waitForEvent('download', {
+          timeout: 30000,
+          predicate: (d) => !d.suggestedFilename()?.endsWith('.csv')
+        });
+
+        await link.click();
+        const download = await downloadPromise;
+
+        let filename = download.suggestedFilename();
+        if (!filename) {
+          filename = `flipkart_po_${globalIndex}_${Date.now()}.xls`;
+        }
+
+        const filepath = path.join(this.tempDir, filename);
+        await download.saveAs(filepath);
+        downloadedFiles.push(filepath);
+        console.log(`✅ Downloaded: ${filename}`);
+
+        await this.page.waitForTimeout(1000);
+      } catch (error) {
+        console.error(`❌ Error downloading PO ${globalIndex}: ${error.message}`);
+      }
+    }
+
+    return { downloadedFiles, downloadedCount: downloadedFiles.length };
   }
 
   /**
@@ -1201,8 +1234,11 @@ export class FlipkartDownloadPOTask extends BaseTask {
    */
   async downloadSinglePO(button, index) {
     try {
-      // Set up download listener before clicking
-      const downloadPromise = this.page.waitForEvent('download', { timeout: 30000 });
+      // Set up download listener before clicking (exclude CSV files from background Download List)
+      const downloadPromise = this.page.waitForEvent('download', {
+        timeout: 30000,
+        predicate: (d) => !d.suggestedFilename()?.endsWith('.csv')
+      });
 
       // Click the download button
       await button.click();
@@ -1239,9 +1275,9 @@ export class FlipkartDownloadPOTask extends BaseTask {
     const outputFilename = generateMergedFilename('filflo_flipkart_po', '.xlsx');
     const outputPath = path.join(this.downloadPath, outputFilename);
 
-    // Use flattenAndMergePoFiles to handle PO-specific flattening
-    // Pass file info objects with path and orderStatus
-    const combinedFile = flattenAndMergePoFiles(downloadedFiles, outputPath, warehouseMapping);
+    // Extract file paths from file info objects (flattenAndMergePoFiles expects string paths)
+    const filePaths = downloadedFiles.map(f => typeof f === 'string' ? f : f.path);
+    const combinedFile = flattenAndMergePoFiles(filePaths, outputPath, warehouseMapping);
     return combinedFile;
   }
 

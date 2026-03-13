@@ -27,13 +27,16 @@ export class FlipkartLoginTask extends BaseTask {
     // Step 2: Enter email
     await this.enterEmail();
 
-    // Step 3: Enter password
+    // Step 3: Click Proceed to advance to password step
+    await this.clickProceedAfterEmail();
+
+    // Step 4: Enter password
     await this.enterPassword();
 
-    // Step 4: Wait for user to solve CAPTCHA and submit
+    // Step 5: Wait for user to solve CAPTCHA and submit
     await this.waitForUserLogin();
 
-    // Step 5: Select FKI + Company
+    // Step 6: Select FKI + Company
     await this.selectFKI();
 
     console.log('\n✅ Flipkart login completed successfully!\n');
@@ -98,6 +101,47 @@ export class FlipkartLoginTask extends BaseTask {
   }
 
   /**
+   * Click "Proceed" button after entering email to advance to the password step
+   */
+  async clickProceedAfterEmail() {
+    console.log('🔍 Looking for Proceed button...');
+
+    const buttonTexts = ['Proceed', 'Next', 'Continue'];
+    for (const text of buttonTexts) {
+      try {
+        const button = this.page.locator(`button:has-text("${text}")`).first();
+        const isVisible = await button.isVisible({ timeout: 3000 }).catch(() => false);
+        if (isVisible) {
+          await button.click();
+          console.log(`✅ Clicked "${text}" button`);
+          await this.page.waitForTimeout(2000);
+          return;
+        }
+      } catch (err) {
+        continue;
+      }
+    }
+
+    // Fallback: try submit button
+    try {
+      const submitButton = await this.page.$('button[type="submit"]');
+      if (submitButton) {
+        await submitButton.click();
+        console.log('✅ Clicked submit button to proceed');
+        await this.page.waitForTimeout(2000);
+        return;
+      }
+    } catch (err) {
+      // Continue to fallback
+    }
+
+    // Last resort: press Enter
+    console.log('⚠️  Proceed button not found, pressing Enter...');
+    await this.page.keyboard.press('Enter');
+    await this.page.waitForTimeout(2000);
+  }
+
+  /**
    * Enter password
    */
   async enterPassword() {
@@ -110,7 +154,7 @@ export class FlipkartLoginTask extends BaseTask {
       'input[id*="password" i]'
     ];
 
-    const passwordSelector = await this.waitForElement(passwordSelectors, 10000);
+    const passwordSelector = await this.waitForElement(passwordSelectors, 15000);
     console.log('⌨️  Entering password...');
 
     // Use fill() instead of type() for passwords with special characters
